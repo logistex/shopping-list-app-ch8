@@ -153,6 +153,16 @@
       padding: 24px 0;
     }
 
+    .status {
+      margin: 0 0 12px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: rgba(214, 69, 69, 0.1);
+      color: var(--danger);
+      font-size: 0.9rem;
+    }
+    .status[hidden] { display: none; }
+
     .footer {
       display: flex;
       justify-content: flex-end;
@@ -177,9 +187,11 @@
     <p class="summary" id="summary"></p>
 
     <form id="add-form">
-      <input type="text" id="item-input" placeholder="살 물건을 입력하세요" autocomplete="off" autofocus />
+      <input type="text" id="item-input" placeholder="살 물건을 입력하세요" maxlength="200" autocomplete="off" autofocus />
       <button type="submit" class="add-btn">추가</button>
     </form>
+
+    <p class="status" id="status" role="alert" hidden></p>
 
     <ul id="list"></ul>
     <p class="empty" id="empty">아직 아이템이 없어요.</p>
@@ -189,33 +201,54 @@
     </div>
   </main>
 
-  <script>
-    const STORAGE_KEY = "shopping-list-items";
+  <script type="module">
+    import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/+esm";
+
+    // 공개(publishable) 키는 브라우저에 노출되어도 되는 키이며, 접근 권한은 RLS 정책이 결정한다.
+    const SUPABASE_URL = "https://rkkebybdtoqfbplshrvq.supabase.co";
+    const SUPABASE_KEY = "sb_publishable_MtwMHuEA_z3xKmi_Fx1bIw_gjOmrXTC";
+    const TABLE = "shop_items";
+    const LEGACY_STORAGE_KEY = "shopping-list-items"; // 예전 로컬 스토리지 키 (한 번만 옮긴다)
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
     const form = document.getElementById("add-form");
     const input = document.getElementById("item-input");
     const list = document.getElementById("list");
     const empty = document.getElementById("empty");
     const summary = document.getElementById("summary");
+    const status = document.getElementById("status");
     const clearDoneBtn = document.getElementById("clear-done");
 
-    let items = load();
+    let items = [];
+    let loaded = false;
 
-    function load() {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        return raw ? JSON.parse(raw) : [];
-      } catch {
-        return [];
-      }
+    function showError(message, error) {
+      console.error(message, error);
+      status.textContent = message;
+      status.hidden = false;
     }
 
-    function save() {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-      } catch {
-        // 저장소를 쓸 수 없는 환경이면 메모리에만 유지
-      }
+    function clearError() {
+      status.hidden = true;
+      status.textContent = "";
+    }
+
+    function sortItems() {
+      items.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    }
+
+    // 같은 id가 있으면 바꾸고, 없으면 추가한다 (실시간 이벤트가 중복으로 와도 안전)
+    function upsertLocal(row) {
+      const index = items.findIndex((i) => i.id === row.id);
+      if (index === -1) items.push(row);
+      else items[index] = row;
+      sortItems();
+    }
+
+    function removeLocal(ids) {
+      const set = new Set(ids);
+      items = items.filter((i) => !set.has(i.id));
     }
 
     function render() {
@@ -249,48 +282,130 @@
 
       const total = items.length;
       const doneCount = items.filter((i) => i.done).length;
-      empty.hidden = total > 0;
-      summary.textContent = total
-        ? `전체 ${total}개 · 완료 ${doneCount}개 · 남은 ${total - doneCount}개`
-        : "필요한 물건을 추가해 보세요.";
+      empty.hidden = !loaded || total > 0;
+      if (!loaded) summary.textContent = "불러오는 중…";
+      else
+        summary.textContent = total
+          ? `전체 ${total}개 · 완료 ${doneCount}개 · 남은 ${total - doneCount}개`
+          : "필요한 물건을 추가해 보세요.";
       clearDoneBtn.hidden = doneCount === 0;
     }
 
-    function addItem(text) {
-      items.push({ id: Date.now() + Math.random().toString(36).slice(2), text, done: false });
-      save();
+    async function loadItems() {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .select("id, text, done, created_at")
+        .order("created_at", { ascending: true });
+      if (error) return showError("목록을 불러오지 못했어요.", error);
+      items = data;
+      loaded = true;
+      clearError();
       render();
     }
 
-    function toggleItem(id) {
+    // 예전에 로컬 스토리지에만 저장했던 항목이 있으면 데이터베이스로 한 번 옮긴다
+    async function migrateLegacyItems() {
+      let legacy;
+      try {
+        legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) || "[]");
+      } catch {
+        return;
+      }
+      if (!Array.isArray(legacy) || legacy.length === 0) return;
+
+      const rows = legacy
+        .filter((i) => typeof i?.text === "string" && i.text.trim())
+        .map((i) => ({ text: i.text.trim().slice(0, 200), done: Boolean(i.done) }));
+      if (rows.length) {
+        const { error } = await supabase.from(TABLE).insert(rows);
+        if (error) return showError("예전 항목을 옮기지 못했어요.", error);
+      }
+      try {
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      } catch {
+        // 지울 수 없어도 동작에는 문제없음
+      }
+    }
+
+    async function addItem(text) {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .insert({ text })
+        .select("id, text, done, created_at")
+        .single();
+      if (error) return showError("항목을 추가하지 못했어요.", error);
+      clearError();
+      upsertLocal(data);
+      render();
+    }
+
+    async function toggleItem(id) {
       const item = items.find((i) => i.id === id);
-      if (item) item.done = !item.done;
-      save();
+      if (!item) return;
+      const done = !item.done;
+
+      item.done = done; // 화면에 먼저 반영
+      render();
+
+      const { error } = await supabase.from(TABLE).update({ done }).eq("id", id);
+      if (error) {
+        item.done = !done; // 실패하면 되돌린다
+        render();
+        return showError("상태를 바꾸지 못했어요.", error);
+      }
+      clearError();
+    }
+
+    async function deleteItem(id) {
+      const { error } = await supabase.from(TABLE).delete().eq("id", id);
+      if (error) return showError("항목을 삭제하지 못했어요.", error);
+      clearError();
+      removeLocal([id]);
       render();
     }
 
-    function deleteItem(id) {
-      items = items.filter((i) => i.id !== id);
-      save();
+    async function clearDone() {
+      const ids = items.filter((i) => i.done).map((i) => i.id);
+      if (ids.length === 0) return;
+      const { error } = await supabase.from(TABLE).delete().in("id", ids);
+      if (error) return showError("완료 항목을 지우지 못했어요.", error);
+      clearError();
+      removeLocal(ids);
       render();
     }
 
-    form.addEventListener("submit", (e) => {
+    // 다른 창이나 기기에서 바뀐 내용을 실시간으로 받는다
+    function subscribeChanges() {
+      supabase
+        .channel("shop-items-changes")
+        .on("postgres_changes", { event: "*", schema: "public", table: TABLE }, (payload) => {
+          if (payload.eventType === "DELETE") removeLocal([payload.old.id]);
+          else upsertLocal(payload.new);
+          render();
+        })
+        .subscribe((state) => {
+          // 처음 연결되거나 끊겼다가 다시 연결되면 놓친 변경이 없도록 전체를 다시 읽는다
+          if (state === "SUBSCRIBED") loadItems();
+          else if (state === "CHANNEL_ERROR" || state === "TIMED_OUT")
+            showError("실시간 연결이 끊겼어요. 다시 연결하는 중…");
+        });
+    }
+
+    form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const text = input.value.trim();
       if (!text) return;
-      addItem(text);
       input.value = "";
       input.focus();
+      await addItem(text);
     });
 
-    clearDoneBtn.addEventListener("click", () => {
-      items = items.filter((i) => !i.done);
-      save();
-      render();
-    });
+    clearDoneBtn.addEventListener("click", clearDone);
 
     render();
+    await migrateLegacyItems();
+    await loadItems();
+    subscribeChanges();
   </script>
 </body>
 </html>
