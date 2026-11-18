@@ -222,6 +222,8 @@
 
     let items = [];
     let loaded = false;
+    let channel = null; // 실시간 구독 채널
+    let listRun = 0; // 시작/정지할 때마다 늘려서, 늦게 도착한 이전 응답을 버린다
 
     function showError(message, error) {
       console.error(message, error);
@@ -292,10 +294,12 @@
     }
 
     async function loadItems() {
+      const run = listRun;
       const { data, error } = await supabase
         .from(TABLE)
         .select("id, text, done, created_at")
         .order("created_at", { ascending: true });
+      if (run !== listRun) return; // 그사이 정지했으면 버린다
       if (error) return showError("목록을 불러오지 못했어요.", error);
       items = data;
       loaded = true;
@@ -376,7 +380,7 @@
 
     // 다른 창이나 기기에서 바뀐 내용을 실시간으로 받는다
     function subscribeChanges() {
-      supabase
+      channel = supabase
         .channel("shop-items-changes")
         .on("postgres_changes", { event: "*", schema: "public", table: TABLE }, (payload) => {
           if (payload.eventType === "DELETE") removeLocal([payload.old.id]);
@@ -402,10 +406,32 @@
 
     clearDoneBtn.addEventListener("click", clearDone);
 
-    render();
-    await migrateLegacyItems();
-    await loadItems();
-    subscribeChanges();
+    // 목록을 불러오고 실시간 구독을 시작한다
+    async function startList() {
+      const run = ++listRun;
+      items = [];
+      loaded = false;
+      render();
+      await migrateLegacyItems();
+      if (run !== listRun) return;
+      await loadItems();
+      if (run !== listRun) return;
+      subscribeChanges();
+    }
+
+    // 구독을 끊고 화면의 목록을 비운다
+    function stopList() {
+      listRun++;
+      if (channel) {
+        supabase.removeChannel(channel);
+        channel = null;
+      }
+      items = [];
+      loaded = false;
+      render();
+    }
+
+    startList();
   </script>
 </body>
 </html>
